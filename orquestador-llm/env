@@ -1,5 +1,5 @@
 # .env (ejemplo)
-OPENROUTER_API_KEY=sk-or-xxxx
+OPENROUTER_API_KEYsk-or-xxxx
 OPENROUTER_MODEL=anthropic/claude-3.5-sonnet  # o openai/gpt-4o-mini, meta/llama-3.1-70b-instruct, etc.
 RELAY_WS=ws://127.0.0.1:7070/ws?callId=live
 RELAY_EVENT=http://127.0.0.1:7070/event
