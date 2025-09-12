@@ -1,69 +1,157 @@
-# React + TypeScript + Vite
+# EchoCoach - Frontend de Live Coaching
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Frontend de la aplicación de coach de llamadas en tiempo real construido con React, TypeScript y Vite. Esta aplicación proporciona una interfaz de usuario para que los agentes de ventas/soporte reciban consejos de coaching en tiempo real durante las llamadas.
 
-Currently, two official plugins are available:
+## 🎯 Características Principales
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **Live Coaching en Tiempo Real**: Recibe consejos de coaching mientras la llamada está en progreso
+- **Transcripción en Vivo**: Visualiza transcripciones parciales y finales de la conversación
+- **KPIs de Conversación**: Métricas de tiempo de habla entre agente y cliente
+- **Alertas Inteligentes**: Notificaciones cuando se detectan objeciones o riesgos
+- **Interfaz Intuitiva**: Diseño limpio y fácil de usar para agentes
 
-## Expanding the ESLint configuration
+## 🚀 Instalación y Configuración
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+### Prerrequisitos
 
-```js
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- Node.js 18+ 
+- npm o yarn
+- Acceso al Relay WebSocket (puerto 7070)
 
-      // Remove tseslint.configs.recommended and replace with this
-      ...tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      ...tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      ...tseslint.configs.stylisticTypeChecked,
+### Instalación
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# Instalar dependencias
+npm install
+
+# Ejecutar en modo desarrollo
+npm run dev
+
+# Construir para producción
+npm run build
+
+# Vista previa de la build
+npm run preview
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Configuración
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+La aplicación se conecta al sistema de coach de llamadas a través de:
 
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+1. **Relay URL**: URL del servidor relay (ej: `ws://localhost:7070`)
+2. **Call ID**: Identificador único de la llamada (UUID o linkedid de Asterisk)
+
+#### Configuración por URL
+
+Puedes pasar los parámetros directamente en la URL:
+
 ```
+http://localhost:5173/?relayUrl=ws://localhost:7070&callId=503ee774-1234-5678-9abc-def012345678
+```
+
+#### Configuración Manual
+
+Usa el formulario en la interfaz para configurar:
+- **Relay URL**: `ws://localhost:7070` (por defecto)
+- **Call ID**: UUID de la llamada activa
+
+## 🏗️ Arquitectura
+
+### Componentes Principales
+
+- **`App.tsx`**: Componente principal con configuración y estado global
+- **`LiveCoach.tsx`**: Componente principal que maneja la conexión WebSocket y renderiza la interfaz
+- **`Bubble`**: Componente para mostrar mensajes de transcripción
+- **`CoachBubble`**: Componente para mostrar consejos de coaching
+
+### Flujo de Datos
+
+1. **Conexión WebSocket**: Se conecta al Relay WebSocket usando `relayUrl` y `callId`
+2. **Recepción de Eventos**: Recibe eventos de tipo:
+   - `partial`: Transcripción parcial en tiempo real
+   - `final`: Transcripción final de un turno
+   - `coach`: Consejos de coaching del orquestador LLM
+3. **Renderizado**: Actualiza la interfaz con transcripciones y consejos
+
+### Tipos de Eventos
+
+```typescript
+type Speaker = 'agent' | 'customer';
+type Evt = 
+  | { type: 'partial' | 'final'; callId: string; speaker: Speaker; text: string; turnId: string; tsStart: number; tsEnd?: number; }
+  | { type: 'coach'; callId: string; mode: 'tip' | 'alert'; severity: 'low' | 'med' | 'high'; text: string; turnRef: string; };
+```
+
+## 📊 KPIs y Métricas
+
+La aplicación calcula automáticamente:
+
+- **Talk/Listen Ratio**: Proporción de tiempo de habla entre agente y cliente
+- **Número de Turnos**: Cantidad de intervenciones por cada participante
+- **Tiempo Total**: Duración de la conversación
+
+## 🎨 Personalización
+
+### Estilos
+
+Los estilos están definidos como objetos JavaScript en cada componente para facilitar la personalización.
+
+### Configuración de Desarrollo
+
+```bash
+# Linting
+npm run lint
+
+# Type checking
+npx tsc --noEmit
+```
+
+## 🔧 Desarrollo
+
+### Estructura del Proyecto
+
+```
+src/
+├── App.tsx          # Componente principal
+├── LiveCoach.tsx    # Componente de coaching en vivo
+├── App.css          # Estilos globales
+├── index.css        # Estilos base
+└── main.tsx         # Punto de entrada
+```
+
+### Scripts Disponibles
+
+- `npm run dev`: Servidor de desarrollo con HMR
+- `npm run build`: Construcción para producción
+- `npm run preview`: Vista previa de la build
+- `npm run lint`: Linting con ESLint
+
+## 🌐 Integración
+
+Esta aplicación se integra con:
+
+- **Relay WebSocket**: Para recibir eventos de transcripción y coaching
+- **Sistema Asterisk**: A través del ARI y aplicaciones de Node.js
+- **Orquestador LLM**: Para recibir consejos de coaching generados por IA
+
+## 📱 Uso
+
+1. **Iniciar la aplicación**: `npm run dev`
+2. **Configurar conexión**: Ingresar Relay URL y Call ID
+3. **Iniciar llamada**: El sistema comenzará a mostrar transcripciones y consejos
+4. **Monitorear KPIs**: Observar métricas de conversación en tiempo real
+
+## 🛠️ Troubleshooting
+
+### Problemas Comunes
+
+1. **No se conecta al WebSocket**: Verificar que el Relay esté ejecutándose en el puerto 7070
+2. **No recibe transcripciones**: Verificar que el Call ID sea correcto y la llamada esté activa
+3. **No recibe consejos de coaching**: Verificar que el orquestador LLM esté funcionando
+
+### Logs de Desarrollo
+
+La aplicación registra en consola:
+- Conexiones WebSocket
+- Eventos recibidos
+- Errores de conexión
