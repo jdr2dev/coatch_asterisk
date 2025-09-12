@@ -1,0 +1,212 @@
+// ari-coach-app.js
+// ARI completo: inbound a Stasis -> bridge -> originate agente -> ExternalMedia (mix/customer/agent)
+// Asigna puertos únicos por llamada y evita el bucle usando app secundaria para Snoop.
+// Requiere: npm i ari-client
+
+import AriClient from 'ari-client';
+import { spawn } from 'child_process';
+
+/**********************
+ * Configuración
+ **********************/
+const CFG = {
+  ARI_URL: process.env.ARI_URL || 'http://127.0.0.1:8088',
+  ARI_USER: process.env.ARI_USER || 'coach',
+  ARI_PASS: process.env.ARI_PASS || 'verysecret',
+  APP: process.env.APP || 'coach_app',                 // app principal
+  SNOOP_APP: process.env.SNOOP_APP || 'coach_snoop',   // app secundaria (sin lógica)
+
+  // A dónde enviar el audio RTP (donde vive rtp2ws / gateway STT)
+  STT_HOST: process.env.STT_HOST || '127.0.0.1',
+
+  // Puerto base para asignar bloques de 3 (mix/customer/agent)
+  BASE_PORT: parseInt(process.env.BASE_PORT || '14000', 10),
+
+  // A quién llamar como agente (puede ser una cola)
+  AGENT_DIAL: process.env.AGENT_DIAL || 'PJSIP/201',
+
+  // Lanzar rtp2ws por llamada (requiere /opt/asterisk-stt/rtp2ws/call-rtp2ws.js)
+  LAUNCH_RTP2WS: (process.env.LAUNCH_RTP2WS || 'true').toLowerCase() === 'true',
+  RTP2WS_BIN: process.env.RTP2WS_BIN || 'node',
+  RTP2WS_SCRIPT: process.env.RTP2WS_SCRIPT || '/opt/asterisk-stt/rtp2ws/call-rtp2ws.js',
+
+  // Logging básico
+  LOG_PREFIX: process.env.LOG_PREFIX || 'ARI',
+};
+
+/**********************
+ * Utilidades
+ **********************/
+function log(...args) { console.log(`[${CFG.LOG_PREFIX}]`, ...args); }
+function warn(...args) { console.warn(`[${CFG.LOG_PREFIX}]`, ...args); }
+function err(...args) { console.error(`[${CFG.LOG_PREFIX}]`, ...args); }
+
+// Parseo de argumentos de Stasis ("k=v,k2=v2")
+function parseArgs(str) {
+  const out = {}; (str || '').split(',').forEach(p => { const [k, v] = p.split('='); if (k && typeof v !== 'undefined') out[k] = v; });
+  return out;
+}
+
+// Asignador de puertos por llamada (bloques de 3)
+let nextBlock = 0; // contador simple; en producción podrías reciclar más finamente
+function allocPorts() {
+  const base = CFG.BASE_PORT + nextBlock * 3;
+  nextBlock = (nextBlock + 1) % 100000; // evita overflow
+  return { mix: base, customer: base + 1, agent: base + 2 };
+}
+
+// Estado por llamada
+const calls = new Map();
+// calls.set(callId, { bridgeId, custId, agentId, ports, child, createdAt })
+
+/**********************
+ * App principal
+ **********************/
+(async () => {
+  const ari = await AriClient.connect(CFG.ARI_URL, CFG.ARI_USER, CFG.ARI_PASS);
+
+  // Maneja SOLO eventos de la app principal
+  ari.on('StasisStart', async (evt, ch) => {
+    if (evt.application !== CFG.APP) return; // ignora otras apps (p.ej. SNOOP_APP)
+
+    const kv = parseArgs(evt.args?.[0] || '');
+    const role = kv.role || '';
+
+    // Evita bucles: solo procesamos el canal con role=caller (el que vino del dialplan)
+    if (role !== 'caller') {
+      log('Ignorado StasisStart no-caller:', ch.id, 'role=', role);
+      return;
+    }
+
+    const direction = kv.direction || 'inbound';
+    const fn = kv.fn || ch.id;
+    const callId = ch.id; // puedes usar ch.channelvars?.SIPCALLID si prefieres
+
+    log('INBOUND caller:', callId, 'dir=', direction);
+
+    // 1) Crea bridge mixing y añade el canal cliente
+    const bridge = await ari.bridges.create({ type: 'mixing' });
+    await bridge.addChannel({ channel: ch.id });
+
+    // 2) Origina al agente (entra a la misma app con role=agent)
+    const agent = await ari.channels.originate({
+      endpoint: CFG.AGENT_DIAL,
+      app: CFG.APP,
+      appArgs: `role=agent,direction=${direction},fn=${fn},bridgeId=${bridge.id},parent=${callId}`,
+      callerId: ch.caller ? ch.caller.number : '0000',
+      timeout: 30,
+    });
+
+    // 3) Reserva puertos y guarda estado temporal
+    const ports = allocPorts();
+    calls.set(callId, { bridgeId: bridge.id, custId: ch.id, agentId: agent.id, ports, child: null, createdAt: Date.now() });
+
+    // 4) Cuando el agente entre, únelo al bridge y activa media
+    const onAgentJoin = async (ev, ch2) => {
+      if (ev.application !== CFG.APP) return;
+      const kv2 = parseArgs(ev.args?.[0] || '');
+      if (kv2.role === 'agent' && kv2.bridgeId === bridge.id) {
+        try {
+          await ari.bridges.addChannel({ bridgeId: bridge.id, channel: ch2.id });
+          log('Bridge listo:', bridge.id, 'agent:', ch2.id);
+          await setupMedia(ari, bridge.id, ch.id, ch2.id, callId);
+          // Suscribir a hangups para limpiar
+          ch.on('StasisEnd', () => cleanupCall(ari, callId));
+          ch2.on('StasisEnd', () => cleanupCall(ari, callId));
+        } catch (e) {
+          err('Error al unir agente/activar media:', e?.message || e);
+          await cleanupCall(ari, callId);
+        } finally {
+          ari.removeListener('StasisStart', onAgentJoin);
+        }
+      }
+    };
+    ari.on('StasisStart', onAgentJoin);
+  });
+
+  // Arranca ambas apps; la secundaria no tiene handlers (evita loops de Snoop)
+  ari.start(CFG.APP);
+  ari.start(CFG.SNOOP_APP);
+  log(`Apps ARI listas -> principal: '${CFG.APP}' · snoop: '${CFG.SNOOP_APP}'`);
+
+  // Apagado limpio
+  process.on('SIGINT', async () => { await shutdown(ari); });
+  process.on('SIGTERM', async () => { await shutdown(ari); });
+})();
+
+/**********************
+ * Media & helpers
+ **********************/
+async function setupMedia(ari, bridgeId, custId, agentId, callId) {
+  const st = calls.get(callId);
+  if (!st) return;
+
+  const { mix, customer, agent } = st.ports;
+  log(`Activando ExternalMedia: mix=${mix} customer=${customer} agent=${agent}`);
+
+  // --- MIX GLOBAL (rápido para STT/LLM en vivo) ---
+  await ari.bridges.externalMedia({
+    bridgeId,
+    external_host: `${CFG.STT_HOST}:${mix}`,
+    format: 'slin16',
+    encapsulation: 'rtp',
+    direction: 'out',
+  });
+
+  // --- SEPARADO POR CANAL (para etiquetar agente/cliente) ---
+  await ari.channels.externalMedia({
+    app: CFG.APP,
+    channelId: custId,
+    external_host: `${CFG.STT_HOST}:${customer}`,
+    format: 'slin16', encapsulation: 'rtp', direction: 'out',
+  });
+  await ari.channels.externalMedia({
+    app: CFG.APP,
+    channelId: agentId,
+    external_host: `${CFG.STT_HOST}:${agent}`,
+    format: 'slin16', encapsulation: 'rtp', direction: 'out',
+  });
+
+  // --- (Opcional) Snoop: ¡siempre en app secundaria para evitar bucles! ---
+  // await ari.channels.snoopChannel({ channelId: custId, spy: 'both', app: CFG.SNOOP_APP });
+  // await ari.channels.snoopChannel({ channelId: agentId, spy: 'both', app: CFG.SNOOP_APP });
+
+  // --- Lanzar rtp2ws por llamada (si está habilitado) ---
+  if (CFG.LAUNCH_RTP2WS) {
+    const args = [CFG.RTP2WS_SCRIPT,
+      `--callId=${callId}`,
+      `--stt=ws://127.0.0.1:8080/stream`,
+      `--mix=${mix}`, `--customer=${customer}`, `--agent=${agent}`,
+    ];
+    const child = spawn(CFG.RTP2WS_BIN, args, { stdio: 'inherit' });
+    child.on('exit', (code, sig) => warn(`rtp2ws (${callId}) salió code=${code} sig=${sig}`));
+    const st2 = calls.get(callId); if (st2) st2.child = child;
+    log('rtp2ws lanzado para', callId);
+  }
+}
+
+async function cleanupCall(ari, callId) {
+  const st = calls.get(callId);
+  if (!st) return;
+  log('Limpieza llamada', callId);
+  // Mata rtp2ws
+  try { if (st.child && !st.child.killed) st.child.kill('SIGTERM'); } catch {}
+  // Destruye bridge
+  try { await ariBridgeDestroy(ariSafe(ariRef), st.bridgeId); } catch {}
+  calls.delete(callId);
+}
+
+// Guardamos una referencia global segura al cliente ARI para usar en cleanup
+let ariRef = null;
+function ariSafe(ref) { ariRef = ref || ariRef; return ariRef; }
+async function ariBridgeDestroy(ari, bridgeId) { if (!ari) return; try { await ari.Bridge({ id: bridgeId }).destroy(); } catch {} }
+
+async function shutdown(ari) {
+  warn('Apagando…');
+  for (const [callId, st] of calls) {
+    try { if (st.child && !st.child.killed) st.child.kill('SIGTERM'); } catch {}
+    try { await ariBridgeDestroy(ari, st.bridgeId); } catch {}
+    calls.delete(callId);
+  }
+  setTimeout(() => process.exit(0), 200);
+}

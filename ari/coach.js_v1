@@ -1,0 +1,110 @@
+import AriClient from 'ari-client';
+
+const ARI_URL = 'http://127.0.0.1:8088';
+const ARI_USER = 'coach';
+const ARI_PASS = 'verysecret';
+const APP = 'coach_app';
+
+const STT_HOST = '127.0.0.1';     // host donde escucha tu rtp2ws/ffmpeg
+const MIX_PORT = 5000;            // mix (ambos)
+const CUST_PORT = 5001;           // cliente "in" respecto a canal del cliente
+const AGENT_PORT = 5002;          // agente "in" respecto a canal del agente
+const AGENT_DIAL = 'PJSIP/201';  // a quién llamar
+
+const active = new Map(); // callId -> {bridgeId, custId, agentId, ...}
+
+function arg(map, key, def=null){
+  const kv = (map || '').split(',').reduce((a,p)=>{
+    const [k,v] = p.split('='); if(k&&v) a[k]=v; return a;
+  },{});
+  return kv[key] ?? def;
+}
+
+AriClient.connect(ARI_URL, ARI_USER, ARI_PASS).then(async ari => {
+  ari.on('StasisStart', async (evt, ch) => {
+    if (ch.channelvars?.SIPCALLID) {
+      console.log('SIP CALL-ID:', ch.channelvars.SIPCALLID);
+    }
+    const args = evt.args?.[0] || '';
+    const role = arg(args, 'role', 'caller');
+    const direction = arg(args, 'direction', 'inbound');
+    const fn = arg(args, 'fn', ch.id);
+
+    console.log(`StasisStart: ${ch.id} role=${role} dir=${direction}`);
+
+    // Crea bridge mixing
+    const bridge = await ari.bridges.create({type:'mixing'});
+    await bridge.addChannel({channel: ch.id});
+
+    // Origina al agente
+    const agent = await ari.channels.originate({
+      endpoint: AGENT_DIAL,
+      app: APP,
+      appArgs: `role=agent,direction=${direction},fn=${fn},bridgeId=${bridge.id}`,
+      callerId: ch.caller ? ch.caller.number : '0000'
+    });
+
+    // Guarda estado
+    active.set(ch.id, { bridgeId: bridge.id, custId: ch.id, agentId: agent.id, fn });
+
+    // Cuando agente entre a Stasis, lo añadimos al bridge
+    const onAgentJoin = (ev, ch2) => {
+      const a = arg(ev.args?.[0], 'role', '');
+      const bId = arg(ev.args?.[0], 'bridgeId', '');
+      if (a === 'agent' && bId === bridge.id) {
+        ari.bridges.addChannel({ bridgeId: bridge.id, channel: ch2.id })
+          .then(() => {
+            console.log('Bridge listo', bridge.id);
+            setupMedia(ari, bridge.id, ch.id, ch2.id);
+          });
+        ari.removeListener('StasisStart', onAgentJoin);
+      }
+    };
+    ari.on('StasisStart', onAgentJoin);
+
+    ch.on('StasisEnd', async () => { await teardown(ari, bridge.id); });
+    agent.on('StasisEnd', async () => { await teardown(ari, bridge.id); });
+  });
+
+  async function setupMedia(ari, bridgeId, custId, agentId){
+    console.log('Activando ExternalMedia/Snoop...');
+
+    // --- MIX GLOBAL (rápido para STT/LLM en vivo) ---
+    await ari.bridges.externalMedia({
+      bridgeId,
+      external_host: `${STT_HOST}:${MIX_PORT}`,
+      format: 'slin16',
+      encapsulation: 'rtp',
+      direction: 'out'
+    });
+
+    // --- SEPARADO POR CANAL (si quieres diarización perfecta por rol) ---
+    // Cliente (captura 'out' del canal del cliente = lo que él dice)
+    await ari.channels.externalMedia({
+      app: APP, external_host: `${STT_HOST}:${CUST_PORT}`,
+      format: 'slin16', encapsulation: 'rtp', direction: 'out',
+      channelId: custId
+    });
+
+    // Agente (captura 'out' del canal del agente = lo que el agente dice)
+    await ari.channels.externalMedia({
+      app: APP, external_host: `${STT_HOST}:${AGENT_PORT}`,
+      format: 'slin16', encapsulation: 'rtp', direction: 'out',
+      channelId: agentId
+    });
+
+    // (Opcional) SnoopChannel para otras funciones (barge-in, etc.)
+    await ari.channels.snoopChannel({ channelId: custId, spy:'both', app: APP });
+    await ari.channels.snoopChannel({ channelId: agentId, spy:'both', app: APP });
+  }
+
+  async function teardown(ari, bridgeId){
+    try {
+      const b = ari.Bridge({id: bridgeId});
+      await b.destroy();
+    } catch {}
+  }
+
+  ari.start(APP);
+  console.log(`ARI app '${APP}' esperando llamadas...`);
+}).catch(console.error);
