@@ -3,3 +3,4 @@ node_modules/
 ari/node_modules
 models/
 hf-cache/
+front/react-app/node_modules
