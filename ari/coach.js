@@ -1,230 +1,86 @@
-// coach.js  (ESM, Node >= 18)
-// Ejecuta: node coach.js
-// Env vars (opcionales):
-//   ARI_URL=http://127.0.0.1:8088  ARI_USER=coach  ARI_PASS=verysecret  ARI_APP=coach_app  AGENT_ENDPOINT=PJSIP/1001
-
+// coach-ari-ports.js
 import AriClient from 'ari-client';
+import { spawn } from 'child_process';
 
-const ARI_URL  = process.env.ARI_URL  || 'http://127.0.0.1:8088';
-const ARI_USER = process.env.ARI_USER || 'coach';
-const ARI_PASS = process.env.ARI_PASS || 'verysecret';
-const APP      = process.env.ARI_APP  || 'coach_app';
-const AGENT_ENDPOINT = process.env.AGENT_ENDPOINT || 'PJSIP/201';
+const ARI_URL='http://127.0.0.1:8088', ARI_USER='coach', ARI_PASS='verysecret';
+const APP='coach_app';
+const STT_HOST='127.0.0.1';
+const BASE_PORT=14000; // incrementa por llamada
+let nextBlock = 0;
 
-// Estado en memoria: linkedid -> { bridgeId, legs:{channelId:{...}}, agentDialed, createdAt }
-const calls = new Map();
+const inUse = new Map(); // callId -> {bridgeId, custId, agentId, ports, child}
 
-function ensureCall(linkedid) {
-  let c = calls.get(linkedid);
-  if (!c) {
-    c = { linkedid, bridgeId: undefined, legs: {}, agentDialed: false, createdAt: Date.now() };
-    calls.set(linkedid, c);
-  }
-  return c;
+function allocPorts(){
+  const base = BASE_PORT + nextBlock*3;
+  nextBlock = (nextBlock+1) % 10000;
+  return { mix:base, customer:base+1, agent:base+2 };
 }
 
-function safeNum(n) {
-  return (n || '').trim();
-}
+AriClient.connect(ARI_URL, ARI_USER, ARI_PASS).then(async ari => {
 
-function log(...args) { console.log(new Date().toISOString(), ...args); }
-function warn(...args) { console.warn(new Date().toISOString(), ...args); }
+  ari.on('StasisStart', async (evt, ch) => {
+    const callId = ch.id; // o usa SIPCALLID si prefieres
+    const ports = allocPorts();
 
-// Helpers ---------------
-async function getOrCreateBridge(ari, call) {
-  if (call.bridgeId) return call.bridgeId;
-  // Crear bridge de tipo mixing
-  const bridge = ari.Bridge();
-  await bridge.create({ type: 'mixing' });
-  call.bridgeId = bridge.id;
-  log('[BRIDGE] created', bridge.id, 'linkedid=', call.linkedid);
-  return call.bridgeId;
-}
+    // Bridge
+    const bridge = await ari.bridges.create({type:'mixing'});
+    await bridge.addChannel({channel: ch.id});
 
-async function addIfNeeded(ari, call, channelId) {
-  const leg = call.legs[channelId];
-  if (!leg || leg.addedToBridge) return;
-  const bridgeId = await getOrCreateBridge(ari, call);
-  try {
-    await ari.bridges.addChannel({ bridgeId, channel: channelId });
-    leg.addedToBridge = true;
-    log('[BRIDGE] addChannel ok', bridgeId, 'ch=', channelId, 'role=', leg.role);
-  } catch (e) {
-    warn('[BRIDGE] addChannel fail', bridgeId, 'ch=', channelId, e && (e.message || e));
-  }
-}
-
-async function originateAgentIfNeeded(ari, call) {
-  if (call.agentDialed) return;
-  call.agentDialed = true;
-  try {
-    const ch = await ari.channels.originate({
-      endpoint: AGENT_ENDPOINT,
+    // Origina agente
+    const agent = await ari.channels.originate({
+      endpoint: 'PJSIP/1001',
       app: APP,
-      appArgs: 'agent',               // ← rol explícito
-      variables: { ROLE: 'agent' },   // (opcional)
-      callerId: 'Coach <6000>',
-      timeout: 30
+      appArgs: `role=agent,bridgeId=${bridge.id},callId=${callId}`,
+      callerId: ch.caller?.number || '0000'
     });
-    log('[ORIGINATE] agent dialing', AGENT_ENDPOINT, '-> ch=', ch.id, 'linkedid=', call.linkedid);
-  } catch (e) {
-    warn('[ORIGINATE] agent failed', e && (e.message || e));
-  }
-}
 
-function roleFrom(evt /*, channel */) {
-  const fromArgs = Array.isArray(evt?.args) ? evt.args[0] : undefined;
-  const v = (fromArgs || '').toLowerCase();
-  if (v === 'inbound' || v === 'agent') return v;
-  return 'unknown';
-}
+    // Espera a que el agente entre para unir y activar media
+    const onAgentJoin = async (ev, ch2) => {
+      if (ev.args?.[0]?.includes(`role=agent`) && ev.args?.[0]?.includes(`bridgeId=${bridge.id}`)) {
+        await ari.bridges.addChannel({ bridgeId: bridge.id, channel: ch2.id });
 
-async function cleanupIfDone(ari, linked) {
-  const call = calls.get(linked);
-  if (!call) return;
+        // --- ExternalMedia hacia puertos únicos ---
+        await ari.bridges.externalMedia({
+          bridgeId: bridge.id, external_host: `${STT_HOST}:${ports.mix}`,
+          format: 'slin16', encapsulation: 'rtp', direction: 'out'
+        });
+        await ari.channels.externalMedia({
+          app: APP, channelId: ch.id, external_host: `${STT_HOST}:${ports.customer}`,
+          format: 'slin16', encapsulation: 'rtp', direction: 'out'
+        });
+        await ari.channels.externalMedia({
+          app: APP, channelId: ch2.id, external_host: `${STT_HOST}:${ports.agent}`,
+          format: 'slin16', encapsulation: 'rtp', direction: 'out'
+        });
 
-  const legsLeft = Object.keys(call.legs).length;
-  if (legsLeft > 0) return;
+        // --- Lanza rtp2ws por esta llamada ---
+        const args = [
+          `/opt/asterisk-stt/rtp2ws/call-rtp2ws.js`,
+          `--callId=${callId}`,
+          `--stt=ws://127.0.0.1:8080/stream`,
+          `--mix=${ports.mix}`, `--customer=${ports.customer}`, `--agent=${ports.agent}`
+        ];
+        const child = spawn('node', args, { stdio:'inherit' });
 
-  try {
-    if (call.bridgeId) {
-      try {
-        await ari.bridges.destroy({ bridgeId: call.bridgeId });
-        log('[BRIDGE] destroyed', call.bridgeId, 'linkedid=', linked);
-      } catch {
-        // puede estar ya destruido
+        inUse.set(callId, { bridgeId: bridge.id, custId: ch.id, agentId: ch2.id, ports, child });
+        ari.removeListener('StasisStart', onAgentJoin);
       }
-    }
-  } finally {
-    calls.delete(linked);
-    log('[CLEAN] removed state linkedid=', linked);
-  }
-}
-
-// ---- MAIN ----
-(async () => {
-  const ari = await AriClient.connect(ARI_URL, ARI_USER, ARI_PASS);
-  log(`[BOOT] Connected to ARI ${ARI_URL}, starting app=${APP}`);
-
-  // ----------------- EVENTOS ARI -----------------
-
-  // Un canal entra en la app
-  ari.on('StasisStart', async (evt, channel) => {
-    const chId = channel.id;
-    const linked = channel.linkedid || chId; // fallback
-    const role = roleFrom(evt, channel);
-
-    const call = ensureCall(linked);
-    call.legs[chId] = {
-      id: chId,
-      role,
-      ready: Boolean(channel.caller?.number),
-      caller: safeNum(channel.caller?.number),
-      connected: safeNum(channel.connected?.number),
-      addedToBridge: false
     };
+    ari.on('StasisStart', onAgentJoin);
 
-    log('[ARI] StasisStart ch=', chId, 'role=', role, 'linkedid=', linked, 'caller=', call.legs[chId].caller || '(none)');
-
-    if (role === 'inbound') {
-      // Asegura contestación del leg entrante (por si no viene contestado del dialplan)
-      try { await channel.answer(); } catch {}
-      // Origina al agente una sola vez por linkedid
-      await originateAgentIfNeeded(ari, call);
-    }
-
-    // Prepara bridge y si está listo el leg, añádelo
-    await getOrCreateBridge(ari, call);
-    if (call.legs[chId].ready) {
-      await addIfNeeded(ari, call, chId);
-    }
+    // Limpieza al colgar cualquiera
+    const cleanup = async () => {
+      const s = inUse.get(callId);
+      if (s?.child && !s.child.killed) s.child.kill('SIGTERM');
+      try { await ari.Bridge({id: s?.bridgeId || bridge.id}).destroy(); } catch {}
+      inUse.delete(callId);
+    };
+    ch.on('StasisEnd', cleanup);
+    agent.on('StasisEnd', cleanup);
   });
 
-  // Cuando se conoce el callerId
-  ari.on('ChannelCallerId', async (evt, channel) => {
-    const chId = channel.id;
-    const linked = channel.linkedid || chId;
-    const call = calls.get(linked);
-    if (!call) return;
-
-    const leg = call.legs[chId];
-    if (!leg) return;
-
-    leg.caller = safeNum(channel.caller?.number) || leg.caller;
-    leg.connected = safeNum(channel.connected?.number) || leg.connected;
-
-    if (!leg.ready) {
-      leg.ready = true;
-      log('[ARI] CallerId ready ch=', chId, 'role=', leg.role, 'caller=', leg.caller);
-      await addIfNeeded(ari, call, chId);
-    }
-  });
-
-  // Cuando el canal cambia a Up
-  ari.on('ChannelStateChange', async (evt, channel) => {
-    if (channel?.state !== 'Up') return;
-    const chId = channel.id;
-    const linked = channel.linkedid || chId;
-    const call = calls.get(linked);
-    if (!call) return;
-
-    const leg = call.legs[chId];
-    if (!leg) return;
-
-    if (!leg.ready) {
-      leg.caller = leg.caller || safeNum(channel.caller?.number) || safeNum(channel.connected?.number);
-      leg.ready = true;
-      log('[ARI] State Up -> ready ch=', chId, 'role=', leg.role, 'caller=', leg.caller);
-      await addIfNeeded(ari, call, chId);
-    }
-  });
-
-  // Fin de Stasis del canal
-  ari.on('StasisEnd', async (evt, channel) => {
-    const chId = channel.id;
-    const linked = channel.linkedid || chId;
-    const call = calls.get(linked);
-    if (!call) return;
-
-    delete call.legs[chId];
-    log('[ARI] StasisEnd ch=', chId, 'linkedid=', linked);
-    await cleanupIfDone(ari, linked);
-  });
-
-  // Canal destruido
-  ari.on('ChannelDestroyed', async (evt, channel) => {
-    const chId = channel.id;
-    const linked = channel.linkedid || chId;
-    const call = calls.get(linked);
-    if (!call) return;
-
-    delete call.legs[chId];
-    log('[ARI] ChannelDestroyed ch=', chId, 'linkedid=', linked);
-    await cleanupIfDone(ari, linked);
-  });
-
-  // Bridge destruido (si llega)
-  ari.on('BridgeDestroyed', async (evt) => {
-    const bridgeId = evt?.bridge?.id;
-    if (!bridgeId) return;
-    for (const c of calls.values()) {
-      if (c.bridgeId === bridgeId) c.bridgeId = undefined;
-    }
-    log('[BRIDGE] destroyed event', bridgeId);
-  });
-
-  // Errores
-  ari.on('error', (err) => {
-    warn('[ARI] error', err && (err.message || err));
-  });
-
-  // IMPORTANTE: iniciar la app ARI (sustituye a apps.subscribe)
   ari.start(APP);
+  console.log(`ARI '${APP}' listo.`);
+}).catch(console.error);
 
-  // Señales de proceso
-  process.on('SIGINT', () => { log('SIGINT'); process.exit(0); });
-  process.on('SIGTERM', () => { log('SIGTERM'); process.exit(0); });
-})().catch((e) => {
-  console.error('FATAL', e && (e.stack || e));
-  process.exit(1);
-});
+
