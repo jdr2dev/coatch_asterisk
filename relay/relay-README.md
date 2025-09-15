@@ -201,3 +201,8 @@ curl -X POST http://localhost:7070/event \
 - **Encoding**: UTF-8
 - **Timeout**: Sin timeout (conexiones persistentes)
 - **Reconexión**: Los clientes deben implementar reconexión automática
+
+
+## verificar funcionamiento
+
+  npx wscat -c 'ws://127.0.0.1:7070/ws?callId=

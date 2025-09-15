@@ -6,7 +6,8 @@ from fastapi.responses import PlainTextResponse
 import uvicorn
 
 # --- Config ---
-LANG            = os.getenv("LANG","es")
+LANG            = "es"
+#LANG            = os.getenv("LANG","es")
 MODEL_SIZE      = os.getenv("MODEL_SIZE","small")       # small|medium (GPU 8-12GB -> medium)
 DEVICE          = os.getenv("DEVICE","cpu")             # cuda|cpu
 COMPUTE_TYPE    = os.getenv("COMPUTE_TYPE","int8")      # float16 en GPU

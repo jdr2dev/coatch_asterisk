@@ -1,86 +1,116 @@
-// coach-ari-ports.js
+// ari-audio-stt-fixed.js — mixing OK + externalMedia (por bridge) + rtp2ws por llamada
+// Nota: en ARI se crea un canal externalMedia y se añade al bridge. No existe bridges.externalMedia.
+
 import AriClient from 'ari-client';
 import { spawn } from 'child_process';
 
-const ARI_URL='http://127.0.0.1:8088', ARI_USER='coach', ARI_PASS='verysecret';
-const APP='coach_app';
-const STT_HOST='127.0.0.1';
-const BASE_PORT=14000; // incrementa por llamada
-let nextBlock = 0;
+const CFG = {
+  ARI_URL:'http://127.0.0.1:8088', ARI_USER:'coach', ARI_PASS:'verysecret',
+  APP:'coach_app',
+  AGENT_EP: process.env.AGENT_EP || 'PJSIP/201',
+  STT_HOST: process.env.STT_HOST || '127.0.0.1',
+  BASE_PORT: parseInt(process.env.BASE_PORT || '14000',10),
+};
 
-const inUse = new Map(); // callId -> {bridgeId, custId, agentId, ports, child}
-
-function allocPorts(){
-  const base = BASE_PORT + nextBlock*3;
-  nextBlock = (nextBlock+1) % 10000;
-  return { mix:base, customer:base+1, agent:base+2 };
+function parseArgs(s){ const o={}; (s||'').split(',').forEach(p=>{ const [k,v]=p.split('='); if(k&&v!==undefined)o[k]=v; }); return o; }
+async function waitUp(ari, id, who, ms=15000){
+  return new Promise((res,rej)=>{
+    let ok=false;
+    const on=(ev,ch)=>{ if(ch.id===id && ch.state==='Up'){ ok=true; ari.removeListener('ChannelStateChange',on); console.log(`[UP] ${who}`, id); res(); } };
+    ari.on('ChannelStateChange',on);
+    ari.channels.get({channelId:id}).then(info=>{ if(!ok && info?.state==='Up'){ ok=true; ari.removeListener('ChannelStateChange',on); console.log(`[UP-fast] ${who}`, id); res(); } }).catch(()=>{});
+    setTimeout(()=>{ if(!ok){ ari.removeListener('ChannelStateChange',on); rej(new Error(`timeout Up ${who}`)); } }, ms);
+  });
+}
+async function addWithRetry(ari, bridgeId, channelId, label){
+  for (let i=0;i<3;i++){
+    try { await ari.bridges.addChannel({ bridgeId, channel: channelId }); console.log(`[ADD] ${label} -> ${bridgeId}`); return; }
+    catch(e){ console.error(`[ADD-ERR ${i+1}/3] ${label}:`, e?.message||e); await new Promise(r=>setTimeout(r,150)); }
+  }
+  throw new Error(`No pude añadir ${label}`);
 }
 
-AriClient.connect(ARI_URL, ARI_USER, ARI_PASS).then(async ari => {
+let block=0; function allocPorts(){ const base=CFG.BASE_PORT+(block++%100000)*3; return {mix:base, customer:base+1, agent:base+2}; }
 
-  ari.on('StasisStart', async (evt, ch) => {
-    const callId = ch.id; // o usa SIPCALLID si prefieres
-    const ports = allocPorts();
+AriClient.connect(CFG.ARI_URL, CFG.ARI_USER, CFG.ARI_PASS).then(async ari=>{
+  ari.on('StasisStart', async (evt, caller) => {
+    if (evt.application !== CFG.APP) return;
+    const args = parseArgs(evt.args?.[0] || '');
+    if ((args.role||'') !== 'caller') return;
 
-    // Bridge
-    const bridge = await ari.bridges.create({type:'mixing'});
-    await bridge.addChannel({channel: ch.id});
+    console.log('[CALLER]', caller.id, args);
 
-    // Origina agente
+    // 1) mixing bridge + caller
+    const bridge = await ari.bridges.create({ type:'mixing' });
+    console.log('[BRIDGE create]', bridge.id);
+    await addWithRetry(ari, bridge.id, caller.id, 'caller');
+
+    // 2) origina agente
     const agent = await ari.channels.originate({
-      endpoint: 'PJSIP/1001',
-      app: APP,
-      appArgs: `role=agent,bridgeId=${bridge.id},callId=${callId}`,
-      callerId: ch.caller?.number || '0000'
+      endpoint: CFG.AGENT_EP,
+      app: CFG.APP,
+      appArgs: `role=agent,bridgeId=${bridge.id},parent=${caller.id}`,
+      callerId: caller.caller?.number || '0000',
+      timeout: 45
     });
 
-    // Espera a que el agente entre para unir y activar media
-    const onAgentJoin = async (ev, ch2) => {
-      if (ev.args?.[0]?.includes(`role=agent`) && ev.args?.[0]?.includes(`bridgeId=${bridge.id}`)) {
-        await ari.bridges.addChannel({ bridgeId: bridge.id, channel: ch2.id });
+    // 3) cuando agent=Up -> añade, crea externalMedia (mix) y lanza rtp2ws
+    const onState = async (ev, ch) => {
+      if (ch.id !== agent.id) return;
+      if (ch.state === 'Up') {
+        ari.removeListener('ChannelStateChange', onState);
+        try {
+          await waitUp(ari, caller.id, 'caller');
+          await addWithRetry(ari, bridge.id, agent.id, 'agent');
 
-        // --- ExternalMedia hacia puertos únicos ---
-        await ari.bridges.externalMedia({
-          bridgeId: bridge.id, external_host: `${STT_HOST}:${ports.mix}`,
-          format: 'slin16', encapsulation: 'rtp', direction: 'out'
-        });
-        await ari.channels.externalMedia({
-          app: APP, channelId: ch.id, external_host: `${STT_HOST}:${ports.customer}`,
-          format: 'slin16', encapsulation: 'rtp', direction: 'out'
-        });
-        await ari.channels.externalMedia({
-          app: APP, channelId: ch2.id, external_host: `${STT_HOST}:${ports.agent}`,
-          format: 'slin16', encapsulation: 'rtp', direction: 'out'
-        });
+          // Verificación
+          const bi = await ari.bridges.get({ bridgeId: bridge.id });
+          console.log('[BRIDGE info]', bi.id, 'class=', bi.bridge_class, 'tech=', bi.technology, 'channels=', bi.channels);
 
-        // --- Lanza rtp2ws por esta llamada ---
-        const args = [
-          `/opt/asterisk-stt/rtp2ws/call-rtp2ws.js`,
-          `--callId=${callId}`,
-          `--stt=ws://127.0.0.1:8080/stream`,
-          `--mix=${ports.mix}`, `--customer=${ports.customer}`, `--agent=${ports.agent}`
-        ];
-        const child = spawn('node', args, { stdio:'inherit' });
+          // === Captura STT: MIX del bridge ===
+          const {mix, customer, agent:aport} = allocPorts();
 
-        inUse.set(callId, { bridgeId: bridge.id, custId: ch.id, agentId: ch2.id, ports, child });
-        ari.removeListener('StasisStart', onAgentJoin);
+          // 3.1 Crear canal externalMedia (direction=out) y añadirlo al bridge para sacar el MIX
+          const extMix = await ari.channels.externalMedia({
+            app: CFG.APP,
+            external_host: `${CFG.STT_HOST}:${mix}`,
+            format: 'slin16',
+            encapsulation: 'rtp',
+            direction: 'out'
+          });
+          await addWithRetry(ari, bridge.id, extMix.id, 'extMix');
+          console.log('[EM] mix ->', `${CFG.STT_HOST}:${mix}`, 'channel=', extMix.id);
+
+          // (Opcional avanzado) Captura por-rol:
+          // Para sacar "customer" y "agent" por separado se recomienda usar SnoopChannel + otro bridge pequeño
+          // y en cada uno añadir un externalMedia 'out'. Lo dejo como TODO para mantener simple el audio base.
+
+          // Lanza rtp2ws por llamada (escuchará mix/customer/agent, aunque de momento solo enviamos mix)
+          const child = spawn('node', [
+            '/opt/coatch_asterisk/rtp2ws/call-rtp2ws.js',
+            `--callId=${caller.id}`,
+            `--stt=ws://127.0.0.1:8080/stream`,
+            `--mix=${mix}`, `--customer=${customer}`, `--agent=${aport}`
+          ], { stdio:'inherit' });
+          child.on('exit',(c,s)=>console.log('[rtp2ws exit]',c,s));
+
+          // Limpieza al colgar
+          const destroy = async ()=>{
+            try{ await ari.Bridge({id: bridge.id}).destroy(); }catch{}
+            try{ if(!child.killed) child.kill('SIGTERM'); }catch{}
+          };
+          caller.on('StasisEnd', destroy);
+          agent.on('StasisEnd', destroy);
+
+        } catch (e) {
+          console.error('[ERROR en añadido/captura]', e.message);
+          try{ await ari.Bridge({id: bridge.id}).destroy(); }catch{}
+        }
       }
     };
-    ari.on('StasisStart', onAgentJoin);
-
-    // Limpieza al colgar cualquiera
-    const cleanup = async () => {
-      const s = inUse.get(callId);
-      if (s?.child && !s.child.killed) s.child.kill('SIGTERM');
-      try { await ari.Bridge({id: s?.bridgeId || bridge.id}).destroy(); } catch {}
-      inUse.delete(callId);
-    };
-    ch.on('StasisEnd', cleanup);
-    agent.on('StasisEnd', cleanup);
+    ari.on('ChannelStateChange', onState);
   });
 
-  ari.start(APP);
-  console.log(`ARI '${APP}' listo.`);
+  ari.start(CFG.APP);
+  console.log('ARI listo (audio+STT MIX):', CFG.APP);
 }).catch(console.error);
-
-

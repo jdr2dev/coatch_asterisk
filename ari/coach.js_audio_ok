@@ -1,0 +1,67 @@
+// ari-audio-lockstep.js — puenteo mínimo: agrega caller y agent al mixing en cuanto agent=Up
+import AriClient from 'ari-client';
+
+const ARI_URL='http://127.0.0.1:8088';
+const ARI_USER='coach';
+const ARI_PASS='verysecret';
+const APP='coach_app';          // Debe coincidir con tu Stasis()
+const AGENT_EP='PJSIP/201';     // Agente a llamar (ajusta)
+
+function parseArgs(s){ const o={}; (s||'').split(',').forEach(p=>{ const [k,v]=p.split('='); if(k&&v!==undefined)o[k]=v; }); return o; }
+
+async function addWithRetry(ari, bridgeId, channelId, label){
+  for (let i=0;i<3;i++){
+    try { await ari.bridges.addChannel({ bridgeId, channel: channelId }); console.log(`[ADD] ${label} -> ${bridgeId}`); return; }
+    catch(e){ console.error(`[ADD-ERR ${i+1}/3] ${label}:`, e?.message||e); await new Promise(r=>setTimeout(r,150)); }
+  }
+  throw new Error(`No pude añadir ${label}`);
+}
+
+AriClient.connect(ARI_URL, ARI_USER, ARI_PASS).then(async ari=>{
+  ari.on('StasisStart', async (evt, caller) => {
+    if (evt.application !== APP) return;
+    const args = parseArgs(evt.args?.[0] || '');
+    if ((args.role||'') !== 'caller') return;
+
+    console.log('[CALLER]', caller.id, args);
+
+    // 1) Crea un mixing y mete al caller
+    const bridge = await ari.bridges.create({ type: 'mixing' });
+    console.log('[BRIDGE create]', bridge.id);
+    await addWithRetry(ari, bridge.id, caller.id, 'caller');
+
+    // 2) Origina el agente (mismo APP para simplicidad, pero NO dependemos de su StasisStart)
+    const agent = await ari.channels.originate({
+      endpoint: AGENT_EP,
+      app: APP,                           // entrará a Stasis al descolgar
+      appArgs: `role=agent,bridgeId=${bridge.id},parent=${caller.id}`,
+      callerId: caller.caller?.number || '0000',
+      timeout: 45
+    });
+
+    // 3) Cuando el AGENTE pase a Up, lo añadimos al bridge
+    const onState = async (ev, ch) => {
+      if (ch.id !== agent.id) return;
+      // estados posibles: Down -> Ringing -> Up
+      if (ch.state === 'Up') {
+        ari.removeListener('ChannelStateChange', onState);
+        try {
+          await addWithRetry(ari, bridge.id, agent.id, 'agent');
+          const bi = await ari.bridges.get({ bridgeId: bridge.id });
+          console.log('[BRIDGE info]', bi.id, 'class=', bi.bridge_class, 'tech=', bi.technology, 'channels=', bi.channels);
+          // Limpieza
+          const destroy = async ()=>{ try{ await ari.Bridge({id: bridge.id}).destroy(); }catch{} };
+          caller.on('StasisEnd', destroy);
+          agent.on('StasisEnd', destroy);
+        } catch (e) {
+          console.error('[ADD agent error]', e.message);
+          try{ await ari.Bridge({id: bridge.id}).destroy(); }catch{}
+        }
+      }
+    };
+    ari.on('ChannelStateChange', onState);
+  });
+
+  ari.start(APP);
+  console.log('ARI listo:', APP);
+}).catch(console.error);
