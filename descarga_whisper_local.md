@@ -24,3 +24,12 @@ dst="/opt/asterisk-stt/models/faster-whisper-small"
 p=snapshot_download("Systran/faster-whisper-small", local_dir=dst)
 print("Descargado en:", p)
 PY
+
+python3 - <<'PY'
+from huggingface_hub import snapshot_download
+
+dst = "/opt/asterisk-stt/models/faster-whisper-small"
+p = snapshot_download("Systran/faster-whisper-small", local_dir=dst)
+
+print("Descargado en:", p)
+PY
