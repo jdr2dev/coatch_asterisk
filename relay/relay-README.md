@@ -205,4 +205,4 @@ curl -X POST http://localhost:7070/event \
 
 ## verificar funcionamiento
 
-  npx wscat -c 'ws://127.0.0.1:7070/ws?callId=
+  npx wscat -c 'ws://127.0.0.1:7070/ws?callId='
