@@ -23,10 +23,9 @@ function startLeg(speaker, port){
 
   const sock = dgram.createSocket('udp4');
   sock.on('message', msg => {
-    // Si viene RTP estándar: descarta 12 bytes de cabecera
-    if (msg.length <= 12) return;
-    const payload = msg.subarray(12);
-    if (ws.readyState === 1) ws.send(payload);
+    // Enviar RTP completo al servidor STT para que detecte PT (G.711) y decodifique.
+    // Si en tu caso envías PCM16 crudo por UDP, entonces podrías mandar msg directo igual.
+    if (ws.readyState === 1) ws.send(msg);
   });
   sock.bind(port, ()=> console.log(`[${CALL_ID}] UDP ${speaker} -> ${port}`));
 

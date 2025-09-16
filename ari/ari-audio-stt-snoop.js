@@ -19,7 +19,7 @@ const CFG = {
   BASE_PORT:parseInt(process.env.BASE_PORT || '14000', 10),
   TIMEOUT_UP_MS: parseInt(process.env.TIMEOUT_UP_MS || '15000', 10),
   STT_WS_URL: process.env.STT_WS_URL || 'ws://127.0.0.1:8080/stream',
-  FORMAT:    process.env.FORMAT || 'slin16',          // formato de externalMedia
+  FORMAT:    process.env.FORMAT || 'ulaw',            // formato de externalMedia (ulaw|alaw|slin16)
 };
 
 // ---- Utils ----
